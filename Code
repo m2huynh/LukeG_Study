@@ -1,0 +1,372 @@
+
+suppressPackageStartupMessages({
+  library(metafor)
+  library(clubSandwich)
+  library(ggplot2)
+})
+
+options(stringsAsFactors = FALSE)
+
+base_dir <- normalizePath(getwd())
+input_file <- file.path(base_dir, "data.August2026.csv")
+out_dir <- file.path(base_dir, "outputs")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------------------------------------------------------
+# 1. Import and checks
+# -----------------------------------------------------------------------------
+dat <- read.csv(input_file, check.names = FALSE)
+required <- c("EffectSizeID", "StudyID", "Reference", "Intervention", "Population",
+              "Duration", "ni", "Mean_pre", "SD_pre", "Mean_post", "SD_post", "ri")
+missing_columns <- setdiff(required, names(dat))
+if (length(missing_columns) > 0) {
+  stop("Input data are missing required columns: ", paste(missing_columns, collapse = ", "))
+}
+
+# The original code excludes a Thapa reference. It is not present in the supplied CSV.
+dat <- dat[dat$Reference != "Thapa_2024a_PLYO_1", , drop = FALSE]
+dat$StudyID <- factor(dat$StudyID)
+dat$EffectSizeID <- factor(dat$EffectSizeID)
+dat$Intervention <- factor(dat$Intervention, levels = c("BT", "CT", "PT", "ST"))
+dat$Population <- factor(dat$Population)
+
+if (anyNA(dat[, c("ni", "Mean_pre", "SD_pre", "Mean_post", "SD_post", "Duration")])) {
+  stop("The supplied input has missing values in required numeric fields.")
+}
+if (any(dat$ni <= 1 | dat$SD_pre <= 0 | dat$SD_post <= 0)) {
+  stop("Sample sizes must exceed 1 and standard deviations must be positive.")
+}
+
+availability <- data.frame(
+  Item = c("Intervention-arm effect-size rows", "Unique study clusters", "Unique intervention labels",
+           "Control-arm outcome data", "Study-design/control indicator", "Risk-of-bias/quality data",
+           "Exercise-level classification / % modality", "Weekly training-volume data", "DJ drop-height data"),
+  Availability = c(nrow(dat), length(unique(dat$StudyID)), length(unique(dat$Intervention)),
+                   "Not supplied", "Not supplied", "Not supplied", "Not supplied", "Not supplied", "Not supplied"),
+  stringsAsFactors = FALSE
+)
+write.csv(availability, file.path(out_dir, "data_availability.csv"), row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# 2. Effect sizes and models
+# -----------------------------------------------------------------------------
+# SMCR = standardized mean change using raw-score (baseline SD) standardization.
+# metafor::escalc(correct = TRUE) applies Hedges' small-sample bias correction.
+make_effects <- function(data, measure = c("SMCR", "MC"), prepost_r = 0.5) {
+  measure <- match.arg(measure)
+  d <- data
+  d$ri <- prepost_r
+  # metafor's SMCR defines d = (m1i - m2i) / sd1i.  Supply baseline as
+  # time 1 so the standardization is by baseline SD, then reverse the sign
+  # to report improvement as post minus pre.
+  es <- escalc(
+    measure = measure,
+    m1i = Mean_pre, m2i = Mean_post,
+    sd1i = SD_pre, sd2i = SD_post,
+    ni = ni, ri = ri,
+    data = d,
+    append = TRUE,
+    correct = TRUE
+  )
+  es$yi <- -es$yi
+  es
+}
+
+# 'rho_effects' is a separate sensitivity parameter for sampling-error correlation
+# among multiple effects reported within the same study. It is not the pre/post r.
+make_sampling_V <- function(es, rho_effects = 0) {
+  V <- diag(es$vi)
+  groups <- split(seq_len(nrow(es)), es$StudyID)
+  for (idx in groups) {
+    if (length(idx) > 1 && rho_effects != 0) {
+      block <- rho_effects * tcrossprod(sqrt(es$vi[idx]))
+      diag(block) <- es$vi[idx]
+      V[idx, idx] <- block
+    }
+  }
+  V
+}
+
+fit_ml <- function(es, rho_effects = 0, mods = NULL) {
+  V <- make_sampling_V(es, rho_effects)
+  if (is.null(mods)) {
+    rma.mv(
+      yi = yi,
+      V = V,
+      random = ~ 1 | StudyID/EffectSizeID,
+      method = "REML",
+      test = "t",
+      data = es
+    )
+  } else {
+    rma.mv(
+      yi = yi,
+      V = V,
+      mods = mods,
+      random = ~ 1 | StudyID/EffectSizeID,
+      method = "REML",
+      test = "t",
+      data = es
+    )
+  }
+}
+
+# CR2 cluster-robust results respect the 30 study clusters.
+cr2_table <- function(fit, cluster) {
+  x <- as.data.frame(coef_test(fit, vcov = "CR2", cluster = cluster, test = "Satterthwaite"))
+  x$term <- rownames(x)
+  rownames(x) <- NULL
+  x$ci.lb <- x$beta - qt(0.975, df = x$df_Satt) * x$SE
+  x$ci.ub <- x$beta + qt(0.975, df = x$df_Satt) * x$SE
+  x[, c("term", "beta", "SE", "df_Satt", "tstat", "p_Satt", "ci.lb", "ci.ub")]
+}
+
+model_summary <- function(label, fit, es) {
+  ct <- cr2_table(fit, es$StudyID)[1, , drop = FALSE]
+  pred <- tryCatch(predict(fit), error = function(e) NULL)
+  data.frame(
+    Analysis = label,
+    Estimate = ct$beta,
+    SE_CR2 = ct$SE,
+    df_CR2 = ct$df_Satt,
+    CI_lower_CR2 = ct$ci.lb,
+    CI_upper_CR2 = ct$ci.ub,
+    p_CR2 = ct$p_Satt,
+    Sigma2_between_study = if (length(fit$sigma2) >= 1) fit$sigma2[1] else NA_real_,
+    Sigma2_within_study = if (length(fit$sigma2) >= 2) fit$sigma2[2] else NA_real_,
+    QE = fit$QE,
+    Q_p = fit$QEp,
+    PI_lower = if (!is.null(pred) && "pi.lb" %in% names(pred)) pred$pi.lb[1] else NA_real_,
+    PI_upper = if (!is.null(pred) && "pi.ub" %in% names(pred)) pred$pi.ub[1] else NA_real_,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Multilevel I² decomposition using the typical sampling variance from the
+# fitted V matrix. The two random-effects components are study and effect
+# level, respectively.
+multilevel_i2 <- function(fit) {
+  W <- solve(fit$V)
+  P <- W - W %*% fit$X %*% solve(t(fit$X) %*% W %*% fit$X) %*% t(fit$X) %*% W
+  v_typical <- (fit$k - fit$p) / sum(diag(P))
+  denom <- sum(fit$sigma2) + v_typical
+  data.frame(
+    Typical_sampling_variance = v_typical,
+    Sigma2_between_study = fit$sigma2[1],
+    Sigma2_within_study = fit$sigma2[2],
+    I2_between_study_percent = 100 * fit$sigma2[1] / denom,
+    I2_within_study_percent = 100 * fit$sigma2[2] / denom,
+    I2_total_percent = 100 * sum(fit$sigma2) / denom
+  )
+}
+
+# Primary corrected single-group model: SMCR/Hedges g, assumed r = .50,
+# independent sampling errors across intervention arms plus multilevel random effects
+# and CR2 cluster-robust inference by study.
+es_primary <- make_effects(dat, measure = "SMCR", prepost_r = 0.5)
+fit_primary <- fit_ml(es_primary, rho_effects = 0)
+primary_summary <- model_summary("Primary corrected single-group SMCR (r_prepost = 0.50)", fit_primary, es_primary)
+write.csv(primary_summary, file.path(out_dir, "primary_model_summary.csv"), row.names = FALSE)
+write.csv(multilevel_i2(fit_primary), file.path(out_dir, "multilevel_heterogeneity_I2.csv"), row.names = FALSE)
+write.csv(cbind(dat, yi = es_primary$yi, vi = es_primary$vi, sei = sqrt(es_primary$vi)),
+          file.path(out_dir, "effect_sizes_SMCR_r050.csv"), row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# 3. sensitivity to pre/post correlation
+# -----------------------------------------------------------------------------
+r_grid <- c(0.30, 0.50, 0.70, 0.90)
+r_sensitivity <- do.call(rbind, lapply(r_grid, function(r0) {
+  es <- make_effects(dat, measure = "SMCR", prepost_r = r0)
+  fit <- fit_ml(es, rho_effects = 0)
+  out <- model_summary(paste0("SMCR, pre/post r = ", format(r0, nsmall = 2)), fit, es)
+  out$Prepost_correlation <- r0
+  out
+}))
+write.csv(r_sensitivity, file.path(out_dir, "sensitivity_prepost_correlation.csv"), row.names = FALSE)
+
+# Sensitivity to an assumed 0.50 sampling-error correlation among multiple effects
+# within a study. This is a distinct assumption from the pre/post correlation.
+fit_rho50 <- fit_ml(es_primary, rho_effects = 0.5)
+effect_dependency_sensitivity <- model_summary("SMCR, within-study sampling-error rho = 0.50", fit_rho50, es_primary)
+effect_dependency_sensitivity$Within_study_effect_correlation <- 0.5
+write.csv(effect_dependency_sensitivity,
+          file.path(out_dir, "sensitivity_within_study_effect_correlation.csv"), row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# 4. Leave-one-study-out robustness
+# -----------------------------------------------------------------------------
+studies <- levels(dat$StudyID)
+loo <- do.call(rbind, lapply(studies, function(study) {
+  es_d <- es_primary[es_primary$StudyID != study, , drop = FALSE]
+  fit_d <- fit_ml(es_d, rho_effects = 0)
+  out <- model_summary(paste0("Omit StudyID ", study), fit_d, es_d)
+  out$Omitted_StudyID <- study
+  out$Omitted_Reference <- paste(unique(dat$Reference[dat$StudyID == study]), collapse = "; ")
+  out$Effects_omitted <- sum(dat$StudyID == study)
+  out
+}))
+loo <- loo[, c("Omitted_StudyID", "Omitted_Reference", "Effects_omitted", "Estimate", "SE_CR2", "df_CR2",
+               "CI_lower_CR2", "CI_upper_CR2", "p_CR2", "Sigma2_between_study", "Sigma2_within_study",
+               "QE", "Q_p", "PI_lower", "PI_upper")]
+write.csv(loo, file.path(out_dir, "leave_one_study_out.csv"), row.names = FALSE)
+
+png(file.path(out_dir, "leave_one_study_out.png"), width = 1800, height = 1100, res = 180)
+loo_plot <- loo[order(loo$Estimate), ]
+plot(seq_len(nrow(loo_plot)), loo_plot$Estimate, pch = 19, xaxt = "n",
+     ylim = range(c(loo_plot$CI_lower_CR2, loo_plot$CI_upper_CR2, primary_summary$Estimate)),
+     xlab = "Omitted study (ordered by resulting pooled estimate)",
+     ylab = "Pooled Hedges g (single-group SMCR)",
+     main = "Leave-one-study-out sensitivity")
+arrows(seq_len(nrow(loo_plot)), loo_plot$CI_lower_CR2,
+       seq_len(nrow(loo_plot)), loo_plot$CI_upper_CR2,
+       angle = 90, code = 3, length = 0.03)
+abline(h = primary_summary$Estimate, lty = 2, col = "#B2182B", lwd = 2)
+mtext("Dashed line: all-study primary corrected estimate", side = 3, line = 0.1, cex = 0.8)
+dev.off()
+
+# -----------------------------------------------------------------------------
+# 5. raw mean-change sensitivity
+# -----------------------------------------------------------------------------
+# All RSI values are already in m/s. MC returns mean post-pre change in m/s.
+es_mc <- make_effects(dat, measure = "MC", prepost_r = 0.5)
+fit_mc <- fit_ml(es_mc, rho_effects = 0)
+mc_summary <- model_summary("Raw mean change (m/s), pre/post r = 0.50", fit_mc, es_mc)
+write.csv(mc_summary, file.path(out_dir, "sensitivity_raw_mean_change.csv"), row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# 6. continuous duration meta-regression
+# -----------------------------------------------------------------------------
+es_duration <- es_primary
+es_duration$Duration_c <- es_duration$Duration - mean(es_duration$Duration)
+fit_duration <- fit_ml(es_duration, rho_effects = 0, mods = ~ Duration_c)
+duration_results <- cr2_table(fit_duration, es_duration$StudyID)
+duration_results$Interpretation <- c(
+  "Estimated Hedges g at the mean observed duration",
+  "Change in Hedges g per additional week of duration"
+)
+write.csv(duration_results, file.path(out_dir, "meta_regression_duration.csv"), row.names = FALSE)
+
+# -----------------------------------------------------------------------------
+# 7. Existing subgroup moderators, refit correctly (not threshold sensitivities)
+# -----------------------------------------------------------------------------
+summarize_factor_moderator <- function(es, variable, label, group_file, omnibus_file) {
+  # -1 produces one corrected pooled estimate per level under a common
+  # multilevel heterogeneity structure; CR2 CIs/test statistics are by study.
+  f_groups <- as.formula(paste0("~ ", variable, " - 1"))
+  fit_groups <- fit_ml(es, rho_effects = 0, mods = f_groups)
+  groups <- cr2_table(fit_groups, es$StudyID)
+  groups$Group <- sub(paste0("^", variable), "", groups$term)
+  groups <- groups[, c("Group", "beta", "SE", "df_Satt", "tstat", "p_Satt", "ci.lb", "ci.ub")]
+
+  f_difference <- as.formula(paste0("~ ", variable))
+  fit_difference <- fit_ml(es, rho_effects = 0, mods = f_difference)
+  C <- diag(length(coef(fit_difference)))[-1, , drop = FALSE]
+  omnibus <- tryCatch(
+    as.data.frame(Wald_test(fit_difference, constraints = C, vcov = "CR2",
+                            cluster = es$StudyID, test = "HTZ")),
+    error = function(e) data.frame(error = conditionMessage(e))
+  )
+  write.csv(groups, file.path(out_dir, group_file), row.names = FALSE)
+  write.csv(omnibus, file.path(out_dir, omnibus_file), row.names = FALSE)
+  list(groups = groups, omnibus = omnibus, fit_groups = fit_groups, fit_difference = fit_difference)
+}
+
+modality <- summarize_factor_moderator(
+  es_primary, "Intervention", "Intervention modality",
+  "moderator_modality_group_estimates_CR2.csv", "moderator_modality_omnibus_CR2.csv"
+)
+# Retain the contrast table as a supporting output.
+modality_results <- cr2_table(modality$fit_difference, es_primary$StudyID)
+write.csv(modality_results, file.path(out_dir, "moderator_modality_CR2.csv"), row.names = FALSE)
+
+es_population <- es_primary
+es_population$Population_group <- factor(ifelse(as.character(es_population$Population) == "1", "Athletes", "Non-athletes"),
+                                        levels = c("Athletes", "Non-athletes"))
+population <- summarize_factor_moderator(
+  es_population, "Population_group", "Population",
+  "moderator_population_group_estimates_CR2.csv", "moderator_population_omnibus_CR2.csv"
+)
+
+es_duration_cat <- es_primary
+es_duration_cat$Duration_group <- factor(ifelse(es_duration_cat$Duration < 7, "≤6 weeks", "≥7 weeks"),
+                                         levels = c("≤6 weeks", "≥7 weeks"))
+duration_category <- summarize_factor_moderator(
+  es_duration_cat, "Duration_group", "Categorised duration",
+  "moderator_duration_category_group_estimates_CR2.csv", "moderator_duration_category_omnibus_CR2.csv"
+)
+
+# -----------------------------------------------------------------------------
+# 8. exploratory study-level publication-bias/small-study checks
+# -----------------------------------------------------------------------------
+# Aggregate multiple effects to one precision-weighted effect per study before
+# conventional funnel, Egger, Begg, and trim-and-fill analyses.
+aggregate_to_study <- function(es, rho_effects = 0) {
+  V_full <- make_sampling_V(es, rho_effects)
+  pieces <- lapply(split(seq_len(nrow(es)), es$StudyID), function(idx) {
+    Vb <- V_full[idx, idx, drop = FALSE]
+    one <- rep(1, length(idx))
+    W <- solve(Vb)
+    vi_bar <- as.numeric(1 / (t(one) %*% W %*% one))
+    yi_bar <- as.numeric(vi_bar * (t(one) %*% W %*% es$yi[idx]))
+    data.frame(
+      StudyID = as.character(es$StudyID[idx[1]]),
+      Reference = paste(unique(es$Reference[idx]), collapse = "; "),
+      k_effects = length(idx),
+      yi = yi_bar,
+      vi = vi_bar,
+      sei = sqrt(vi_bar),
+      stringsAsFactors = FALSE
+    )
+  })
+  do.call(rbind, pieces)
+}
+
+study_es <- aggregate_to_study(es_primary, rho_effects = 0)
+fit_study <- rma.uni(yi, vi, method = "REML", data = study_es, test = "knha")
+egger <- tryCatch(regtest(fit_study, model = "rma", predictor = "sei"), error = function(e) e)
+begg <- tryCatch(ranktest(fit_study), error = function(e) e)
+fit_trimfill <- tryCatch(trimfill(fit_study), error = function(e) e)
+
+pb <- data.frame(
+  Analysis = c("Study-level random-effects estimate", "Egger regression test", "Begg rank-correlation test",
+               "Trim-and-fill imputed studies", "Trim-and-fill adjusted estimate"),
+  Statistic = c(
+    as.numeric(coef(fit_study)[1]),
+    if (inherits(egger, "error")) NA_real_ else egger$zval,
+    if (inherits(begg, "error")) NA_real_ else begg$tau,
+    if (inherits(fit_trimfill, "error")) NA_real_ else fit_trimfill$k0,
+    if (inherits(fit_trimfill, "error")) NA_real_ else as.numeric(coef(fit_trimfill)[1])
+  ),
+  P_value = c(
+    fit_study$pval,
+    if (inherits(egger, "error")) NA_real_ else egger$pval,
+    if (inherits(begg, "error")) NA_real_ else begg$pval,
+    NA_real_,
+    if (inherits(fit_trimfill, "error")) NA_real_ else fit_trimfill$pval
+  ),
+  CI_lower = c(
+    fit_study$ci.lb,
+    NA_real_, NA_real_, NA_real_,
+    if (inherits(fit_trimfill, "error")) NA_real_ else fit_trimfill$ci.lb
+  ),
+  CI_upper = c(
+    fit_study$ci.ub,
+    NA_real_, NA_real_, NA_real_,
+    if (inherits(fit_trimfill, "error")) NA_real_ else fit_trimfill$ci.ub
+  ),
+  Note = c(
+    "One inverse-variance aggregated standardized mean change per study (k = 30)",
+    if (inherits(egger, "error")) conditionMessage(egger) else "Exploratory; funnel asymmetry is not proof of publication bias",
+    if (inherits(begg, "error")) conditionMessage(begg) else "Exploratory; limited power and high heterogeneity",
+    "Exploratory sensitivity; not a definitive correction for publication bias",
+    "Exploratory sensitivity; interpret cautiously under high heterogeneity"
+  ),
+  stringsAsFactors = FALSE
+)
+write.csv(study_es, file.path(out_dir, "study_level_effects_for_publication_bias.csv"), row.names = FALSE)
+write.csv(pb, file.path(out_dir, "publication_bias_exploratory.csv"), row.names = FALSE)
+
+png(file.path(out_dir, "funnel_plot_study_level.png"), width = 1600, height = 1200, res = 180)
+funnel(fit_study, xlab = "Study-level aggregated Hedges g (single-group SMCR)",
+       yaxis = "seinv", main = "Exploratory funnel plot (30 study-level estimates)")
+dev.off()
